@@ -15,7 +15,7 @@ import androidx.media.AudioAttributesCompat.CONTENT_TYPE_MUSIC
 import androidx.media.AudioAttributesCompat.USAGE_MEDIA
 import androidx.media.AudioFocusRequestCompat
 import androidx.media.AudioManagerCompat
-import androidx.media.AudioManagerCompat.AUDIOFOCUS_GAIN
+import androidx.media.AudioManagerCompat.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
 import com.doublesymmetry.kotlinaudio.event.EventHolder
 import com.doublesymmetry.kotlinaudio.event.NotificationEventHolder
 import com.doublesymmetry.kotlinaudio.event.PlayerEventHolder
@@ -396,6 +396,7 @@ abstract class BaseAudioPlayer internal constructor(
     }
 
     fun pause() {
+        abandonAudioFocusIfHeld()
         exoPlayer.pause()
     }
 
@@ -406,6 +407,7 @@ abstract class BaseAudioPlayer internal constructor(
      */
     @CallSuper
     open fun stop() {
+        abandonAudioFocusIfHeld()
         playerState = AudioPlayerState.STOPPED
         exoPlayer.playWhenReady = false
         exoPlayer.stop()
@@ -536,12 +538,20 @@ abstract class BaseAudioPlayer internal constructor(
 
         val manager = ContextCompat.getSystemService(context, AudioManager::class.java)
 
-        focus = AudioFocusRequestCompat.Builder(AUDIOFOCUS_GAIN)
+        focus = AudioFocusRequestCompat.Builder(AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
             .setOnAudioFocusChangeListener(this)
             .setAudioAttributes(
                 AudioAttributesCompat.Builder()
                     .setUsage(USAGE_MEDIA)
-                    .setContentType(CONTENT_TYPE_MUSIC)
+                    .setContentType(
+                        when (playerConfig.audioContentType) {
+                            AudioContentType.MUSIC -> C.AUDIO_CONTENT_TYPE_MUSIC
+                            AudioContentType.SPEECH -> C.AUDIO_CONTENT_TYPE_SPEECH
+                            AudioContentType.SONIFICATION -> C.AUDIO_CONTENT_TYPE_SONIFICATION
+                            AudioContentType.MOVIE -> C.AUDIO_CONTENT_TYPE_MOVIE
+                            AudioContentType.UNKNOWN -> C.AUDIO_CONTENT_TYPE_UNKNOWN
+                        }
+                    )
                     .build()
             )
             .setWillPauseWhenDucked(playerOptions.alwaysPauseOnInterruption)
@@ -559,37 +569,56 @@ abstract class BaseAudioPlayer internal constructor(
     private fun abandonAudioFocusIfHeld() {
         if (!hasAudioFocus) return
         Timber.d("Abandoning audio focus...")
-
+    
         val manager = ContextCompat.getSystemService(context, AudioManager::class.java)
-
+    
         val result: Int = if (manager != null && focus != null) {
             AudioManagerCompat.abandonAudioFocusRequest(manager, focus!!)
         } else {
             AudioManager.AUDIOFOCUS_REQUEST_FAILED
         }
-
+    
         hasAudioFocus = (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+        
+        if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            volumeMultiplier = 1f
+            wasDucking = false
+        }
+    
+        Timber.d("Abandon audio focus result: $result, hasAudioFocus: $hasAudioFocus")
     }
 
     override fun onAudioFocusChange(focusChange: Int) {
-        Timber.d("Audio focus changed")
+        Timber.d("Audio focus changed: $focusChange")
         val isPermanent = focusChange == AUDIOFOCUS_LOSS
         val isPaused = when (focusChange) {
             AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> true
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> playerOptions.alwaysPauseOnInterruption
             else -> false
         }
-        if (!playerConfig.handleAudioFocus) {
-            if (isPermanent) abandonAudioFocusIfHeld()
 
-            val isDucking = focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
-                    && !playerOptions.alwaysPauseOnInterruption
-            if (isDucking) {
-                volumeMultiplier = 0.5f
-                wasDucking = true
-            } else if (wasDucking) {
-                volumeMultiplier = 1f
-                wasDucking = false
+        if (!playerConfig.handleAudioFocus) {
+            when (focusChange) {
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                    if (!playerOptions.alwaysPauseOnInterruption) {
+                        Timber.d("Ducking volume")
+                        volumeMultiplier = 0.5f
+                        wasDucking = true
+                    }
+                }
+                AudioManager.AUDIOFOCUS_GAIN -> {
+                    Timber.d("Gained focus, restoring volume")
+                    volumeMultiplier = 1f
+                    wasDucking = false
+                }
+                AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                    Timber.d("Lost focus, restoring volume before abandoning")
+                    volumeMultiplier = 1f
+                    wasDucking = false
+                    if (isPermanent) {
+                        abandonAudioFocusIfHeld()
+                    }
+                }
             }
         }
 
